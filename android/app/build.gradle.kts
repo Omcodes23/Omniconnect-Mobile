@@ -23,6 +23,29 @@ android {
         targetSdk = flutter.targetSdkVersion
         versionCode = flutter.versionCode
         versionName = flutter.versionName
+
+        // We only need the 64-bit ABIs that modern phones ship with. Dropping
+        // 32-bit halves the build time and the APK size of the embedded runtime.
+        ndk {
+            abiFilters += listOf("arm64-v8a", "x86_64")
+        }
+
+        externalNativeBuild {
+            cmake {
+                // llama.cpp is C++17 and uses the NDK's shared STL.
+                arguments += listOf("-DANDROID_STL=c++_shared")
+                cppFlags += listOf("-O3", "-fexceptions", "-frtti")
+            }
+        }
+    }
+
+    // Builds OmniConnect's embedded llama.cpp runtime (libomni_llama.so) straight
+    // into the APK. The shim sources are shared with the desktop build so there
+    // is exactly one place where llama.cpp's ABI is described.
+    externalNativeBuild {
+        cmake {
+            path = file("../../../Desktop-Application/native/omni_llama/CMakeLists.txt")
+        }
     }
 
     buildTypes {

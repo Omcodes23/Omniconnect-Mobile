@@ -47,6 +47,18 @@ dependencies:
   uuid: ^4.6.0
   shared_preferences: ^2.5.5
 
+  # On-device AI: dart:ffi talks to the embedded llama.cpp runtime
+  # (`libomni_llama.so`, built from Desktop-Application/native/omni_llama), and
+  # path_provider locates app-private storage for the downloaded GGUF weights
+  # and the local conversation history. Both were already present transitively;
+  # they are direct dependencies now because the app itself uses them.
+  ffi: ^2.2.0
+  path_provider: ^2.1.6
+  record: ^6.0.0
+  flutter_pcm_sound: ^3.3.3
+  camera: ^0.12.1
+  image: ^4.12.0
+
 dev_dependencies:
   flutter_test:
     sdk: flutter

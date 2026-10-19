@@ -14,6 +14,7 @@ class SignalRService {
   void Function(Map<String, dynamic> call)? onCallAccepted;
   void Function(Map<String, dynamic> call)? onCallRejected;
   void Function(Map<String, dynamic> call)? onCallEnded;
+  void Function(String senderId, String kind, String payload)? onCallMediaReceived;
   void Function(String userId)? onUserOnline;
   void Function(String userId)? onUserOffline;
 
@@ -23,6 +24,7 @@ class SignalRService {
     this.onCallAccepted,
     this.onCallRejected,
     this.onCallEnded,
+    this.onCallMediaReceived,
     this.onUserOnline,
     this.onUserOffline,
   });
@@ -77,6 +79,17 @@ class SignalRService {
         }
       });
 
+      _connection?.on('CallMediaReceived', (args) {
+        if (args != null && args.length >= 3) {
+          final senderId = args[0]?.toString() ?? '';
+          final kind = args[1]?.toString() ?? '';
+          final payload = args[2]?.toString() ?? '';
+          if (senderId.isNotEmpty && kind.isNotEmpty && payload.isNotEmpty) {
+            onCallMediaReceived?.call(senderId, kind, payload);
+          }
+        }
+      });
+
       _connection?.on('UserOnline', (args) {
         if (args != null && args.isNotEmpty && args[0] is String) {
           onUserOnline?.call(args[0] as String);
@@ -92,6 +105,26 @@ class SignalRService {
       await _connection?.start();
     } catch (e) {
       debugPrint('SignalR connection failed: $e');
+    }
+  }
+
+  Future<void> sendCallMedia(
+    String targetUserId,
+    String kind,
+    String payload,
+  ) async {
+    final connection = _connection;
+    if (connection == null ||
+        connection.state != HubConnectionState.connected) {
+      return;
+    }
+    try {
+      await connection.invoke(
+        'SendCallMedia',
+        args: <dynamic>[targetUserId, kind, payload],
+      );
+    } catch (e) {
+      debugPrint('sendCallMedia failed: $e');
     }
   }
 

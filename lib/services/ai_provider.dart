@@ -1,362 +1,668 @@
+/// AI chat state for the fully local, on-device runtime.
+///
+/// There is no provider to pick and no inference server to reach: this file
+/// drives the embedded llama.cpp runtime through [LocalEngine], streams tokens
+/// into [AiState.streamingReply], and persists conversations to disk with
+/// [ConversationStore]. The only network traffic in the whole flow is the
+/// one-time model download performed by [LocalModelManager], which goes straight
+/// to the HuggingFace CDN over plain HTTPS — no auth, no API key, no OmniConnect
+/// server involved.
+///
+/// The companion-mode toggle is the one part that needs OmniConnect Desktop: the
+/// desktop backend is what registers the AI as a chat node, so this proxies the
+/// toggle to `POST /api/ai/bot/toggle` and reports honestly when that backend is
+/// unreachable.
+library;
+
 import 'package:flutter_riverpod/flutter_riverpod.dart';
+
 import 'auth_provider.dart';
+import 'device_provider.dart';
+import 'local_ai/ai_models.dart';
+import 'local_ai/conversation_store.dart';
+import 'local_ai/local_engine.dart';
+import 'local_ai/model_catalog.dart';
+import 'local_ai/model_manager.dart';
 
-class AiMessage {
-  final String id;
-  final String role;
-  final String content;
-  final DateTime timestamp;
+// The message + conversation types and the catalog used to live in this file.
+// They are re-exported so every existing `import '.../services/ai_provider.dart';`
+// keeps compiling with no changes at the call sites.
+export 'local_ai/ai_models.dart';
+export 'local_ai/model_catalog.dart' show ModelCatalog, ModelCatalogEntry;
+export 'local_ai/model_manager.dart' show LocalModelStatus;
 
-  AiMessage({
-    required this.id,
-    required this.role,
-    required this.content,
-    required this.timestamp,
-  });
+/// Sentinel used by [AiState.copyWith] so a nullable field can be *cleared*
+/// rather than only replaced.
+const Object _unset = Object();
 
-  Map<String, dynamic> toJson() => {
-        'role': role,
-        'content': content,
-        'timestamp': timestamp.toIso8601String(),
-      };
-
-  factory AiMessage.fromJson(Map<String, dynamic> json) => AiMessage(
-        id: json['id']?.toString() ?? DateTime.now().millisecondsSinceEpoch.toString(),
-        role: json['role'] ?? 'user',
-        content: json['content'] ?? '',
-        timestamp: json['timestamp'] != null
-            ? DateTime.tryParse(json['timestamp']) ?? DateTime.now()
-            : DateTime.now(),
-      );
-}
-
-class AiConversation {
-  final String id;
-  final String title;
-  final String provider;
-  final String modelName;
-  final List<AiMessage> messages;
-  final DateTime createdAt;
-  final DateTime updatedAt;
-
-  AiConversation({
-    required this.id,
-    required this.title,
-    this.provider = 'OpenAI',
-    this.modelName = 'gpt-4o',
-    this.messages = const [],
-    required this.createdAt,
-    required this.updatedAt,
-  });
-
-  factory AiConversation.fromJson(Map<String, dynamic> json) => AiConversation(
-        id: json['id']?.toString() ?? '',
-        title: json['title'] ?? 'Untitled',
-        provider: json['provider'] ?? 'OpenAI',
-        modelName: json['modelName'] ?? 'gpt-4o',
-        createdAt: json['createdAt'] != null
-            ? DateTime.parse(json['createdAt'])
-            : DateTime.now(),
-        updatedAt: json['updatedAt'] != null
-            ? DateTime.parse(json['updatedAt'])
-            : DateTime.now(),
-      );
-}
-
+/// Everything the AI screen renders.
 class AiState {
+  /// All saved chats, newest first.
   final List<AiConversation> conversations;
+
+  /// The chat currently open, if any.
   final String? currentConversationId;
-  final String selectedProvider;
-  final String selectedModel;
-  final bool isLoading;
-  final String? error;
+
+  /// Committed messages of [currentConversationId] (user + assistant).
   final List<AiMessage> currentMessages;
+
+  /// The catalog with per-model download state, in catalog order.
+  final List<LocalModelStatus> models;
+
+  /// The selected model id (falls back to the catalog default).
+  final String activeModelId;
+
+  /// The model currently downloading, if any.
+  final String? downloadingModelId;
+
+  /// Progress (0..1) of [downloadingModelId].
+  final double downloadProgress;
+
+  /// A generation has been requested and the first token has not arrived yet
+  /// (which includes the time spent loading a model into the runtime).
+  final bool isLoading;
+
+  /// Tokens are actively streaming.
+  final bool isStreaming;
+
+  /// The reply generated so far, or null when nothing is streaming.
+  ///
+  /// Kept separate from [currentMessages] so a partial reply is never written to
+  /// disk; the authoritative full text is only committed once generation ends.
+  final String? streamingReply;
+
+  /// Companion mode (the AI appears as a chat node other people can message).
+  final bool companionEnabled;
+
+  /// `'online' | 'offline' | 'no-model' | 'loading' | 'unknown'`.
+  ///
+  /// The first three mirror the desktop backend. `'loading'` is this client's
+  /// in-flight state and `'unknown'` means the backend could not be reached.
+  final String companionStatus;
+
+  /// The last user-facing error, if any.
+  final String? error;
+
+  /// False when the native runtime is not installed on this device.
+  final bool runtimeAvailable;
 
   const AiState({
     this.conversations = const [],
     this.currentConversationId,
-    this.selectedProvider = 'OpenAI',
-    this.selectedModel = 'gpt-4o',
-    this.isLoading = false,
-    this.error,
     this.currentMessages = const [],
-  });
+    this.models = const [],
+    String? activeModelId,
+    this.downloadingModelId,
+    this.downloadProgress = 0,
+    this.isLoading = false,
+    this.isStreaming = false,
+    this.streamingReply,
+    this.companionEnabled = false,
+    this.companionStatus = 'unknown',
+    this.error,
+    this.runtimeAvailable = true,
+  }) : activeModelId = activeModelId ?? _defaultModelId;
+
+  static const String _defaultModelId = 'qwen2.5-1.5b-instruct-q4km';
+
+  /// True while a reply is being produced (including the model-loading phase).
+  bool get isGenerating => isLoading || isStreaming;
+
+  /// The selected model's status, if the catalog is loaded.
+  LocalModelStatus? get activeModel {
+    for (final m in models) {
+      if (m.entry.id == activeModelId) return m;
+    }
+    return null;
+  }
+
+  /// True when the selected model is fully downloaded and chat can be sent.
+  bool get hasReadyModel => activeModel?.isDownloaded ?? false;
 
   AiState copyWith({
     List<AiConversation>? conversations,
-    String? currentConversationId,
-    String? selectedProvider,
-    String? selectedModel,
-    bool? isLoading,
-    String? error,
+    Object? currentConversationId = _unset,
     List<AiMessage>? currentMessages,
+    List<LocalModelStatus>? models,
+    String? activeModelId,
+    Object? downloadingModelId = _unset,
+    double? downloadProgress,
+    bool? isLoading,
+    bool? isStreaming,
+    Object? streamingReply = _unset,
+    bool? companionEnabled,
+    String? companionStatus,
+    Object? error = _unset,
+    bool? runtimeAvailable,
   }) {
     return AiState(
       conversations: conversations ?? this.conversations,
-      currentConversationId: currentConversationId ?? this.currentConversationId,
-      selectedProvider: selectedProvider ?? this.selectedProvider,
-      selectedModel: selectedModel ?? this.selectedModel,
-      isLoading: isLoading ?? this.isLoading,
-      error: error,
+      currentConversationId: identical(currentConversationId, _unset)
+          ? this.currentConversationId
+          : currentConversationId as String?,
       currentMessages: currentMessages ?? this.currentMessages,
+      models: models ?? this.models,
+      activeModelId: activeModelId ?? this.activeModelId,
+      downloadingModelId: identical(downloadingModelId, _unset)
+          ? this.downloadingModelId
+          : downloadingModelId as String?,
+      downloadProgress: downloadProgress ?? this.downloadProgress,
+      isLoading: isLoading ?? this.isLoading,
+      isStreaming: isStreaming ?? this.isStreaming,
+      streamingReply: identical(streamingReply, _unset)
+          ? this.streamingReply
+          : streamingReply as String?,
+      companionEnabled: companionEnabled ?? this.companionEnabled,
+      companionStatus: companionStatus ?? this.companionStatus,
+      error: identical(error, _unset) ? this.error : error as String?,
+      runtimeAvailable: runtimeAvailable ?? this.runtimeAvailable,
     );
   }
 }
 
+/// Drives [LocalEngine] + [LocalModelManager] + [ConversationStore] and exposes
+/// the result as [AiState].
+///
+/// [build] must be synchronous, so it returns an empty state and kicks off
+/// [_init] on a microtask; the UI fills in as soon as the disk state and the
+/// runtime probe are ready. Everything is lazy: the native runtime is only
+/// touched once the AI screen is actually opened.
 class AiNotifier extends Notifier<AiState> {
+  LocalModelManager? _modelManager;
+  LocalEngine? _engine;
+  ConversationStore? _store;
+
+  bool _initialized = false;
+  bool _disposed = false;
+  bool _generating = false;
+
   @override
-  AiState build() => const AiState();
-
-  void selectProvider(String provider) {
-    final model = _defaultModel(provider);
-    state = state.copyWith(selectedProvider: provider, selectedModel: model);
+  AiState build() {
+    ref.onDispose(() {
+      _disposed = true;
+      _modelManager?.removeListener(_onModelsChanged);
+      _engine?.dispose();
+      _modelManager?.dispose();
+    });
+    Future.microtask(_init);
+    return const AiState();
   }
 
-  void selectModel(String model) {
-    state = state.copyWith(selectedModel: model);
-  }
+  // ── Lifecycle ───────────────────────────────────────────────────────────
 
-  String _defaultModel(String provider) {
-    switch (provider) {
-      case 'Gemini':
-        return 'gemini-2.0-flash';
-      case 'Local':
-        return 'llama-3.1-8b';
-      default:
-        return 'gpt-4o';
-    }
-  }
+  Future<void> _init() async {
+    if (_initialized || _disposed) return;
+    _initialized = true;
 
-  /// Load conversations from the API
-  Future<void> loadConversations() async {
+    final models = _modelManager = LocalModelManager();
+    final store = _store = ConversationStore();
+    final engine = _engine = LocalEngine();
+    models.addListener(_onModelsChanged);
+
+    // Restore chats first so the screen is useful even if the model store is
+    // slow to enumerate (or the runtime is missing entirely).
     try {
-      final api = ref.read(apiServiceProvider);
-      final response = await api.getMap('/api/ai/conversations');
-      final conversationsList = response['conversations'] as List<dynamic>? ?? [];
-      final conversations = conversationsList
-          .map((c) => AiConversation.fromJson(c as Map<String, dynamic>))
-          .toList();
-      state = state.copyWith(conversations: conversations);
+      await store.initialize();
+      final convs = store.conversations;
+      final currentId = store.currentConversationId ??
+          (convs.isNotEmpty ? convs.first.id : null);
+      final current = currentId == null ? null : store.findById(currentId);
+      _update((s) => s.copyWith(
+            conversations: convs,
+            currentConversationId: currentId,
+            currentMessages: current?.messages ?? const [],
+          ));
     } catch (e) {
-      // Silently fail — conversations list remains empty
+      _update((s) => s.copyWith(error: 'Could not load your chats: $e'));
     }
+
+    try {
+      await models.initialize();
+      _update((s) => s.copyWith(
+            models: models.statuses,
+            activeModelId: models.activeModelId,
+          ));
+    } catch (e) {
+      _update((s) => s.copyWith(error: 'Could not read local models: $e'));
+    }
+
+    // One isolate spawn, then cached for the life of the provider.
+    final available = await engine.probeRuntime();
+    _update((s) => s.copyWith(runtimeAvailable: available));
+
+    await refreshCompanionStatus();
+  }
+
+  // ── Conversations ───────────────────────────────────────────────────────
+
+  /// Reload the saved chats from disk. Safe to call repeatedly.
+  Future<void> loadConversations() async {
+    final store = _store;
+    if (store == null) return;
+    await store.initialize();
+    final convs = store.conversations;
+    final currentId =
+        store.currentConversationId ?? (convs.isNotEmpty ? convs.first.id : null);
+    final current = currentId == null ? null : store.findById(currentId);
+    _update((s) => s.copyWith(
+          conversations: convs,
+          currentConversationId: currentId,
+          currentMessages: current?.messages ?? const [],
+          error: null,
+        ));
   }
 
   Future<void> createConversation(String title) async {
-    // POST to /api/ai/chat with no conversationId to create a new conversation
-    try {
-      final api = ref.read(apiServiceProvider);
-      final response = await api.post('/api/ai/chat', {
-        'provider': state.selectedProvider,
-        'model': state.selectedModel,
-        'message': 'Hello',
-        'conversationId': null,
-        'history': [],
-      });
+    final trimmed = title.trim();
+    final conv = AiConversation(
+      id: _newId(),
+      title: trimmed.isEmpty ? 'New chat' : trimmed,
+      provider: 'local',
+      modelName: _activeModelId(),
+      createdAt: DateTime.now(),
+      updatedAt: DateTime.now(),
+    );
 
-      final conversationId = response['conversationId']?.toString();
-      final conv = AiConversation(
-        id: conversationId ?? DateTime.now().millisecondsSinceEpoch.toString(),
-        title: title,
-        provider: state.selectedProvider,
-        modelName: state.selectedModel,
-        createdAt: DateTime.now(),
-        updatedAt: DateTime.now(),
-      );
-      state = state.copyWith(
-        conversations: [conv, ...state.conversations],
-        currentConversationId: conv.id,
-        currentMessages: [],
-      );
-    } catch (e) {
-      // Fallback: create locally if API fails
-      final id = DateTime.now().millisecondsSinceEpoch.toString();
-      final conv = AiConversation(
-        id: id,
-        title: title,
-        provider: state.selectedProvider,
-        modelName: state.selectedModel,
-        createdAt: DateTime.now(),
-        updatedAt: DateTime.now(),
-      );
-      state = state.copyWith(
-        conversations: [conv, ...state.conversations],
-        currentConversationId: id,
-        currentMessages: [],
-      );
+    await _saveConversation(conv);
+    _update((s) => s.copyWith(
+          currentConversationId: conv.id,
+          currentMessages: const [],
+          streamingReply: null,
+          error: null,
+        ));
+  }
+
+  Future<void> selectConversation(String conversationId) async {
+    final conv = _store?.findById(conversationId);
+    _update((s) => s.copyWith(
+          currentConversationId: conversationId,
+          currentMessages: conv?.messages ?? const [],
+          streamingReply: null,
+          error: null,
+        ));
+    try {
+      await _store?.setCurrentConversation(conversationId);
+    } catch (_) {
+      // Selection just will not survive a restart; not worth an error banner.
     }
   }
 
-  void selectConversation(String id) {
-    final conv = state.conversations.firstWhere(
-      (c) => c.id == id,
-      orElse: () => AiConversation(
-        id: '',
-        title: '',
-        createdAt: DateTime.now(),
-        updatedAt: DateTime.now(),
-      ),
-    );
-    state = state.copyWith(
-      currentConversationId: id,
-      currentMessages: conv.messages,
-    );
-    // Load messages from API for this conversation
-    _loadConversationMessages(id);
-  }
+  void clearError() => _update((s) => s.copyWith(error: null));
 
-  Future<void> _loadConversationMessages(String conversationId) async {
-    state = state.copyWith(isLoading: true);
-    try {
-      final api = ref.read(apiServiceProvider);
-      final response = await api.getMap('/api/ai/conversations/$conversationId');
-
-      final messagesList = response['messages'] as List<dynamic>? ?? [];
-      final messages = messagesList
-          .map((m) => AiMessage.fromJson(m as Map<String, dynamic>))
-          .toList();
-
-      // Update conversation title if available
-      final convData = response['conversation'] as Map<String, dynamic>?;
-      final title = convData?['title'] as String?;
-
-      final updatedConversations = state.conversations.map((c) {
-        if (c.id == conversationId) {
-          return AiConversation(
-            id: c.id,
-            title: title ?? c.title,
-            provider: c.provider,
-            modelName: c.modelName,
-            messages: messages,
-            createdAt: c.createdAt,
-            updatedAt: DateTime.now(),
-          );
-        }
-        return c;
-      }).toList();
-
-      state = state.copyWith(
-        currentMessages: messages,
-        isLoading: false,
-        conversations: updatedConversations,
-      );
-    } catch (e) {
-      state = state.copyWith(
-        isLoading: false,
-        error: 'Failed to load messages: $e',
-      );
-    }
-  }
+  // ── Sending ─────────────────────────────────────────────────────────────
 
   Future<void> sendMessage(String content) async {
-    if (content.trim().isEmpty) return;
+    final text = content.trim();
+    if (text.isEmpty || _generating || _disposed) return;
 
-    final userMsg = AiMessage(
-      id: DateTime.now().millisecondsSinceEpoch.toString(),
-      role: 'user',
-      content: content,
-      timestamp: DateTime.now(),
-    );
+    final manager = _modelManager;
+    if (manager == null) return;
 
-    state = state.copyWith(
-      currentMessages: [...state.currentMessages, userMsg],
-      isLoading: true,
-      error: null,
-    );
+    var conversationId = state.currentConversationId;
+    var messages = <AiMessage>[
+      ...state.currentMessages,
+      AiMessage(
+        id: _newId(),
+        role: 'user',
+        content: text,
+        timestamp: DateTime.now(),
+      ),
+    ];
+
+    if (conversationId == null) {
+      conversationId = _newId();
+      final conv = AiConversation(
+        id: conversationId,
+        title: _titleFrom(messages),
+        provider: 'local',
+        modelName: _activeModelId(),
+        createdAt: DateTime.now(),
+        updatedAt: DateTime.now(),
+      );
+      _update((s) => s.copyWith(
+            currentConversationId: conversationId,
+            conversations: _mergeConversation(conv),
+          ));
+    }
+
+    // Write the user turn immediately: it must survive a crash mid-reply.
+    final id = conversationId;
+    await _persistMessages(id, messages);
+    _update((s) => s.copyWith(
+          currentMessages: messages,
+          error: null,
+          streamingReply: null,
+        ));
+
+    // ── Honest pre-flight failures (no model / no runtime) ────────────────
+    if (!state.runtimeAvailable) {
+      await _finishReply(id, messages, LocalEngine.missingRuntimeMessage);
+      return;
+    }
+    if (!state.hasReadyModel) {
+      await _finishReply(id, messages, _noModelMessage);
+      return;
+    }
+
+    _generating = true;
+    _update((s) => s.copyWith(isLoading: true, isStreaming: false));
+
+    final engine = _engine!;
+    engine.clearCancelled();
 
     try {
-      final api = ref.read(apiServiceProvider);
+      await _ensureModelLoaded();
 
-      // Build history from the last 20 messages (excluding the one we just added)
-      final history = state.currentMessages
-          .take(state.currentMessages.length - 1)
-          .toList()
-          .reversed
-          .take(20)
-          .map((m) => m.toJson())
-          .toList();
-
-      final response = await api.post('/api/ai/chat', {
-        'provider': state.selectedProvider,
-        'model': state.selectedModel,
-        'message': content,
-        'conversationId': state.currentConversationId,
-        'history': history,
-      });
-
-      // Backend returns AiChatResponse with 'reply' field
-      final replyContent = response['reply'] as String? ?? 'No response';
-      final conversationId = response['conversationId']?.toString();
-
-      final aiMsg = AiMessage(
-        id: DateTime.now().millisecondsSinceEpoch.toString(),
-        role: 'assistant',
-        content: replyContent,
-        timestamp: DateTime.now(),
-      );
-
-      List<AiMessage> updatedMessages = [...state.currentMessages, aiMsg];
-
-      // Update conversation in the list with new messages
-      List<AiConversation> updatedConversations = List.from(state.conversations);
-      if (conversationId != null) {
-        final existingIndex = updatedConversations.indexWhere(
-            (c) => c.id == conversationId);
-        if (existingIndex >= 0) {
-          updatedConversations[existingIndex] = AiConversation(
-            id: conversationId,
-            title: updatedConversations[existingIndex].title,
-            provider: state.selectedProvider,
-            modelName: state.selectedModel,
-            messages: updatedMessages,
-            createdAt: updatedConversations[existingIndex].createdAt,
-            updatedAt: DateTime.now(),
-          );
-        } else {
-          // New conversation created on server
-          final title =
-              content.length > 50 ? '${content.substring(0, 50)}...' : content;
-          updatedConversations.insert(
-            0,
-            AiConversation(
-              id: conversationId,
-              title: title,
-              provider: state.selectedProvider,
-              modelName: state.selectedModel,
-              messages: updatedMessages,
-              createdAt: DateTime.now(),
-              updatedAt: DateTime.now(),
-            ),
-          );
-        }
-      }
-
-      state = state.copyWith(
-        currentMessages: updatedMessages,
-        isLoading: false,
-        currentConversationId: conversationId ?? state.currentConversationId,
-        conversations: updatedConversations,
-        error: null,
-      );
-    } catch (e) {
-      state = state.copyWith(
-        isLoading: false,
-        error: 'Failed to get AI response: $e',
-        currentMessages: [
-          ...state.currentMessages,
-          AiMessage(
-            id: DateTime.now().millisecondsSinceEpoch.toString(),
-            role: 'assistant',
-            content: '**Error:** $e\n\nMake sure the backend is running and AI provider keys are configured.',
-            timestamp: DateTime.now(),
-          ),
+      final reply = await engine.chat(
+        messages: [
+          for (final m in messages) LocalChatMessage(m.role, m.content),
         ],
+        maxTokens: 512,
+        onToken: (textSoFar) {
+          _update((s) => s.copyWith(
+                isLoading: false,
+                isStreaming: true,
+                streamingReply: textSoFar,
+              ));
+        },
       );
+
+      final partial = state.streamingReply ?? '';
+      final finalText = reply.trim().isNotEmpty ? reply : partial;
+
+      if (engine.wasCancelled && finalText.trim().isEmpty) {
+        // Nothing was produced before the stop: say so instead of adding an
+        // empty bubble.
+        _update((s) => s.copyWith(streamingReply: null, error: 'Generation stopped.'));
+      } else {
+        await _finishReply(id, messages, finalText);
+      }
+    } on LocalRuntimeMissingException catch (e) {
+      _update((s) => s.copyWith(runtimeAvailable: false));
+      await _finishReply(id, messages, e.message);
+    } catch (e) {
+      _update((s) => s.copyWith(streamingReply: null, error: null));
+      await _finishReply(
+        id,
+        messages,
+        'The reply could not be generated on this device. $e',
+      );
+    } finally {
+      engine.clearCancelled();
+      _generating = false;
+      _update((s) => s.copyWith(
+            isLoading: false,
+            isStreaming: false,
+            streamingReply: null,
+          ));
     }
   }
 
-  void clearError() {
-    state = state.copyWith(error: null);
+  /// Ask the running generation to stop. Safe to call from the UI isolate even
+  /// while the engine isolate is blocked inside the native call.
+  void cancelGeneration() => _engine?.cancel();
+
+  // ── Models ──────────────────────────────────────────────────────────────
+
+  /// Start (or resume) a model download. Progress arrives via state updates.
+  Future<void> startDownload(String modelId) async {
+    final manager = _modelManager;
+    if (manager == null) return;
+    _update((s) => s.copyWith(error: null));
+    try {
+      await manager.download(modelId);
+    } catch (e) {
+      _update((s) => s.copyWith(error: 'Could not start the download: $e'));
+    }
+  }
+
+  void cancelDownload(String modelId) => _modelManager?.cancelDownload(modelId);
+
+  /// Switch the active model. The resident model is unloaded so the next send
+  /// loads the new one.
+  Future<void> selectModel(String modelId) async {
+    final manager = _modelManager;
+    if (manager == null) return;
+    if (!manager.isDownloaded(modelId)) return;
+
+    if (!await manager.setActiveModel(modelId)) return;
+
+    try {
+      await _engine?.unload();
+    } catch (_) {
+      // A failed unload just means the swap happens on the next send.
+    }
+    _update((s) => s.copyWith(
+          activeModelId: manager.activeModelId,
+          models: manager.statuses,
+          error: null,
+        ));
+  }
+
+  /// Delete a downloaded model, unloading it first when it is the resident one
+  /// (Windows and Android cannot delete a mapped file).
+  Future<void> deleteModel(String modelId) async {
+    final manager = _modelManager;
+    if (manager == null) return;
+
+    final entry = ModelCatalog.find(modelId);
+    final engine = _engine;
+    if (entry != null && engine != null && engine.loadedPath == manager.pathFor(entry)) {
+      try {
+        await engine.unload();
+      } catch (_) {
+        // The delete below is best-effort anyway.
+      }
+    }
+
+    await manager.delete(modelId);
+    _update((s) => s.copyWith(models: manager.statuses));
+  }
+
+  // ── Companion mode ──────────────────────────────────────────────────────
+
+  /// Read the AI chat node's current state from the desktop backend.
+  Future<void> refreshCompanionStatus() async {
+    try {
+      final api = ref.read(apiServiceProvider);
+      final json = await api.getMap('/api/ai/bot/status');
+      _applyCompanion(json);
+    } catch (_) {
+      // Backend not running / not reachable: say so rather than guessing.
+      _update((s) => s.copyWith(companionStatus: 'unknown'));
+    }
+  }
+
+  /// Enable or disable companion mode through the desktop backend.
+  Future<void> setCompanionEnabled(bool enabled) async {
+    _update((s) => s.copyWith(
+          companionEnabled: enabled,
+          companionStatus: 'loading',
+          error: null,
+        ));
+    try {
+      final api = ref.read(apiServiceProvider);
+      final deviceId = await DeviceListNotifier.getPersistentDeviceId();
+      final displayName =
+          ref.read(authStateProvider).user?.displayName ?? 'Device';
+      final json = await api.post('/api/ai/bot/toggle', {
+        'enabled': enabled,
+        'modelId': state.activeModelId,
+        'deviceId': deviceId,
+        'deviceName': 'Mobile ($displayName)',
+      });
+      _applyCompanion(json);
+    } catch (_) {
+      _update((s) => s.copyWith(
+            companionEnabled: false,
+            companionStatus: 'unknown',
+          ));
+    }
+  }
+
+  void _applyCompanion(Map<String, dynamic> json) {
+    _update((s) => s.copyWith(
+          companionEnabled: json['enabled'] == true,
+          companionStatus: json['status']?.toString() ?? 'unknown',
+        ));
+  }
+
+  // ── Internals ───────────────────────────────────────────────────────────
+
+  static const String _noModelMessage =
+      'No local model is ready yet. Pick a model above and wait for its '
+      'download to finish, then send your message again.';
+
+  /// Load the active model into the runtime when it is not already resident.
+  Future<void> _ensureModelLoaded() async {
+    final engine = _engine!;
+    final manager = _modelManager!;
+
+    final path =
+        manager.getModelPath(state.activeModelId) ?? manager.getActiveModelPath();
+    if (path == null) {
+      throw StateError(_noModelMessage);
+    }
+    if (engine.isModelLoaded && engine.loadedPath == path) return;
+
+    final entry = ModelCatalog.find(state.activeModelId);
+    await engine.loadModel(
+      path,
+      nCtx: entry?.contextLength ?? 4096,
+      nThreads: LocalEngine.defaultThreadCount(),
+    );
+  }
+
+  /// Commit the authoritative reply text and clear the streaming preview.
+  Future<void> _finishReply(
+    String conversationId,
+    List<AiMessage> baseMessages,
+    String text,
+  ) async {
+    final all = <AiMessage>[
+      ...baseMessages,
+      AiMessage(
+        id: _newId(),
+        role: 'assistant',
+        content: text,
+        timestamp: DateTime.now(),
+      ),
+    ];
+    await _persistMessages(conversationId, all);
+    _update((s) => s.copyWith(
+          currentMessages:
+              conversationId == s.currentConversationId ? all : s.currentMessages,
+          streamingReply: null,
+        ));
+  }
+
+  /// Save [messages] as the body of [conversationId], updating the in-memory
+  /// list first so the UI never depends on the write succeeding.
+  Future<void> _persistMessages(
+    String conversationId,
+    List<AiMessage> messages,
+  ) async {
+    final existing =
+        _store?.findById(conversationId) ?? _findInState(conversationId);
+    final base = existing ??
+        AiConversation(
+          id: conversationId,
+          title: _titleFrom(messages),
+          provider: 'local',
+          modelName: _activeModelId(),
+          createdAt: DateTime.now(),
+          updatedAt: DateTime.now(),
+        );
+    final updated = base.copyWith(
+      messages: messages,
+      modelName: _activeModelId(),
+      updatedAt: DateTime.now(),
+    );
+
+    _update((s) => s.copyWith(conversations: _mergeConversation(updated)));
+
+    try {
+      await _store?.save(updated);
+    } catch (e) {
+      _update((s) => s.copyWith(error: 'Could not save this chat: $e'));
+    }
+  }
+
+  Future<void> _saveConversation(AiConversation conv) async {
+    _update((s) => s.copyWith(conversations: _mergeConversation(conv)));
+    try {
+      await _store?.save(conv);
+    } catch (e) {
+      _update((s) => s.copyWith(error: 'Could not save this chat: $e'));
+    }
+  }
+
+  /// Put [conv] at the top of the list (newest first) and drop any older copy.
+  List<AiConversation> _mergeConversation(AiConversation conv) {
+    final merged = <AiConversation>[
+      conv,
+      ...state.conversations.where((c) => c.id != conv.id),
+    ]..sort((a, b) => b.updatedAt.compareTo(a.updatedAt));
+    return merged;
+  }
+
+  AiConversation? _findInState(String id) {
+    for (final c in state.conversations) {
+      if (c.id == id) return c;
+    }
+    return null;
+  }
+
+  void _onModelsChanged() {
+    final manager = _modelManager;
+    if (manager == null || _disposed) return;
+
+    final statuses = manager.statuses;
+    String? downloadingId;
+    double progress = 0;
+    for (final status in statuses) {
+      if (status.isDownloading) {
+        downloadingId = status.entry.id;
+        progress = status.downloadProgress;
+        break;
+      }
+    }
+
+    _update((s) => s.copyWith(
+          models: statuses,
+          activeModelId: manager.activeModelId,
+          downloadingModelId: downloadingId,
+          downloadProgress: progress,
+        ));
+  }
+
+  String _activeModelId() => state.activeModelId;
+
+  void _update(AiState Function(AiState current) change) {
+    if (_disposed) return;
+    state = change(state);
+  }
+
+  static int _idCounter = 0;
+
+  static String _newId() =>
+      '${DateTime.now().microsecondsSinceEpoch}-${_idCounter++}';
+
+  static String _titleFrom(List<AiMessage> messages) {
+    AiMessage? first;
+    for (final m in messages) {
+      if (m.role == 'user') {
+        first = m;
+        break;
+      }
+    }
+    first ??= messages.isNotEmpty ? messages.first : null;
+    if (first == null) return 'New chat';
+
+    final words = first.content.trim().split(RegExp(r'\s+'));
+    final title = words.take(6).join(' ');
+    if (title.isEmpty) return 'New chat';
+    return words.length > 6 ? '$title…' : title;
   }
 }
 

@@ -41,6 +41,7 @@ final routerProvider = Provider<GoRouter>((ref) {
         builder: (context, state) => ChatScreen(
           userId: state.pathParameters['userId'] ?? '',
           userName: state.uri.queryParameters['name'],
+          isInternet: state.uri.queryParameters['internet'] == 'true',
         ),
       ),
       GoRoute(

@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:intl/intl.dart';
+import '../../../core/constants/app_constants.dart';
 import '../../../core/theme/app_theme.dart';
 import '../../../services/chat_provider.dart';
 import '../../../services/auth_provider.dart';
@@ -10,11 +11,13 @@ import '../../calls/presentation/call_screen.dart';
 class ChatScreen extends ConsumerStatefulWidget {
   final String userId;
   final String? userName;
+  final bool isInternet;
 
   const ChatScreen({
     super.key,
     required this.userId,
     this.userName,
+    this.isInternet = false,
   });
 
   @override
@@ -24,6 +27,14 @@ class ChatScreen extends ConsumerStatefulWidget {
 class _ChatScreenState extends ConsumerState<ChatScreen> {
   final _messageController = TextEditingController();
   final _scrollController = ScrollController();
+
+  /// Internet-only: calls are never offered for LAN/Bluetooth chats, the AI
+  /// node, or channel chats (which arrive with an empty user id).
+  bool get _canCall =>
+      widget.userId.isNotEmpty &&
+      widget.isInternet &&
+      widget.userId != AppConstants.aiAssistantUserId &&
+      !(widget.userName ?? '').startsWith(AppConstants.aiAssistantNamePrefix);
 
   @override
   void initState() {
@@ -127,38 +138,40 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
           ],
         ),
         actions: [
-          IconButton(
-            icon: const Icon(Icons.phone_rounded, color: AppTheme.textSecondary, size: 20),
-            onPressed: () => Navigator.push(
-              context,
-              MaterialPageRoute(
-                builder: (_) => CallScreen(
-                  callData: CallData(
-                    userId: widget.userId,
-                    userName: widget.userName ?? 'User',
-                    isVideoCall: false,
+          if (_canCall) ...[
+            IconButton(
+              icon: const Icon(Icons.phone_rounded, color: AppTheme.textSecondary, size: 20),
+              onPressed: () => Navigator.push(
+                context,
+                MaterialPageRoute(
+                  builder: (_) => CallScreen(
+                    callData: CallData(
+                      userId: widget.userId,
+                      userName: widget.userName ?? 'User',
+                      isVideoCall: false,
+                    ),
                   ),
                 ),
               ),
+              tooltip: 'Voice Call',
             ),
-            tooltip: 'Voice Call',
-          ),
-          IconButton(
-            icon: const Icon(Icons.videocam_rounded, color: AppTheme.textSecondary, size: 20),
-            onPressed: () => Navigator.push(
-              context,
-              MaterialPageRoute(
-                builder: (_) => CallScreen(
-                  callData: CallData(
-                    userId: widget.userId,
-                    userName: widget.userName ?? 'User',
-                    isVideoCall: true,
+            IconButton(
+              icon: const Icon(Icons.videocam_rounded, color: AppTheme.textSecondary, size: 20),
+              onPressed: () => Navigator.push(
+                context,
+                MaterialPageRoute(
+                  builder: (_) => CallScreen(
+                    callData: CallData(
+                      userId: widget.userId,
+                      userName: widget.userName ?? 'User',
+                      isVideoCall: true,
+                    ),
                   ),
                 ),
               ),
+              tooltip: 'Video Call',
             ),
-            tooltip: 'Video Call',
-          ),
+          ],
           const SizedBox(width: 4),
         ],
       ),

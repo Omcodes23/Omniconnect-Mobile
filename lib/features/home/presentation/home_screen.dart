@@ -2,6 +2,7 @@ import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:go_router/go_router.dart';
+import '../../../core/constants/app_constants.dart';
 import '../../../core/theme/app_theme.dart';
 import '../../../models/message.dart';
 import '../../../services/auth_provider.dart';
@@ -23,6 +24,7 @@ class _HomeScreenState extends ConsumerState<HomeScreen> with SingleTickerProvid
   late TabController _tabController;
   String? _selectedFriendId;
   String? _selectedFriendName;
+  bool _selectedFriendIsInternet = false;
   final _quickMessageController = TextEditingController();
   final _searchController = TextEditingController();
   Timer? _deviceRefreshTimer;
@@ -583,6 +585,10 @@ class _HomeScreenState extends ConsumerState<HomeScreen> with SingleTickerProvid
         final friend = chatState.friends[i];
         final isSelected = _selectedFriendId == friend.id;
         final isOnline = friend.status == 'Online';
+        // All loaded friends are Internet friendships; the AI node is never
+        // callable.
+        final canCall =
+            friend.id.isNotEmpty && friend.id != AppConstants.aiAssistantUserId;
 
         return Container(
           margin: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
@@ -648,29 +654,31 @@ class _HomeScreenState extends ConsumerState<HomeScreen> with SingleTickerProvid
             trailing: Row(
               mainAxisSize: MainAxisSize.min,
               children: [
-                IconButton(
-                  icon: const Icon(Icons.phone_rounded, color: AppTheme.textSecondary, size: 16),
-                  onPressed: () {
-                    context.push(
-                      '/call/${friend.id}?name=${Uri.encodeComponent(friend.displayName)}&type=audio',
-                    );
-                  },
-                  tooltip: 'Voice Call',
-                  padding: EdgeInsets.zero,
-                  constraints: const BoxConstraints(),
-                ),
-                const SizedBox(width: 8),
-                IconButton(
-                  icon: const Icon(Icons.videocam_rounded, color: AppTheme.textSecondary, size: 16),
-                  onPressed: () {
-                    context.push(
-                      '/call/${friend.id}?name=${Uri.encodeComponent(friend.displayName)}&type=video',
-                    );
-                  },
-                  tooltip: 'Video Call',
-                  padding: EdgeInsets.zero,
-                  constraints: const BoxConstraints(),
-                ),
+                if (canCall) ...[
+                  IconButton(
+                    icon: const Icon(Icons.phone_rounded, color: AppTheme.textSecondary, size: 16),
+                    onPressed: () {
+                      context.push(
+                        '/call/${friend.id}?name=${Uri.encodeComponent(friend.displayName)}&type=audio',
+                      );
+                    },
+                    tooltip: 'Voice Call',
+                    padding: EdgeInsets.zero,
+                    constraints: const BoxConstraints(),
+                  ),
+                  const SizedBox(width: 8),
+                  IconButton(
+                    icon: const Icon(Icons.videocam_rounded, color: AppTheme.textSecondary, size: 16),
+                    onPressed: () {
+                      context.push(
+                        '/call/${friend.id}?name=${Uri.encodeComponent(friend.displayName)}&type=video',
+                      );
+                    },
+                    tooltip: 'Video Call',
+                    padding: EdgeInsets.zero,
+                    constraints: const BoxConstraints(),
+                  ),
+                ],
               ],
             ),
             onTap: () {
@@ -678,11 +686,12 @@ class _HomeScreenState extends ConsumerState<HomeScreen> with SingleTickerProvid
                 setState(() {
                   _selectedFriendId = friend.id;
                   _selectedFriendName = friend.displayName;
+                  _selectedFriendIsInternet = true;
                 });
                 ref.read(chatProvider.notifier).loadMessages(friend.id);
               } else {
                 context.push(
-                  '/chat/${friend.id}?name=${Uri.encodeComponent(friend.displayName)}',
+                  '/chat/${friend.id}?name=${Uri.encodeComponent(friend.displayName)}&internet=true',
                 );
               }
             },
@@ -805,7 +814,7 @@ class _HomeScreenState extends ConsumerState<HomeScreen> with SingleTickerProvid
               onPressed: () {
                 if (d.userId != null) {
                   ref.read(chatProvider.notifier).ensureFriend(d.userId!);
-                  context.push('/chat/${d.userId}?name=${Uri.encodeComponent(d.userName ?? d.deviceName)}');
+                  context.push('/chat/${d.userId}?name=${Uri.encodeComponent(d.userName ?? d.deviceName)}&internet=true');
                 }
               },
               style: ElevatedButton.styleFrom(
@@ -969,17 +978,21 @@ class _HomeScreenState extends ConsumerState<HomeScreen> with SingleTickerProvid
                     if (d.userId != null) {
                       ref.read(chatProvider.notifier).ensureFriend(d.userId!);
                     }
+                    final isInternetDevice =
+                        d.availableTransports.contains('Internet');
                     if (isMasterDetail) {
                       setState(() {
                         _selectedFriendId = d.userId;
                         _selectedFriendName = d.userName ?? d.deviceName;
+                        _selectedFriendIsInternet = isInternetDevice;
                       });
                       if (d.userId != null) {
                         ref.read(chatProvider.notifier).loadMessages(d.userId!);
                       }
                     } else {
                       context.push(
-                        '/chat/${d.userId}?name=${Uri.encodeComponent(d.userName ?? d.deviceName)}',
+                        '/chat/${d.userId}?name=${Uri.encodeComponent(d.userName ?? d.deviceName)}'
+                        '${isInternetDevice ? '&internet=true' : ''}',
                       );
                     }
                   },
@@ -1095,28 +1108,28 @@ class _HomeScreenState extends ConsumerState<HomeScreen> with SingleTickerProvid
                   ],
                 ),
               ),
-              IconButton(
-                icon: const Icon(Icons.phone_rounded, color: AppTheme.textSecondary, size: 18),
-                onPressed: () {
-                  if (_selectedFriendId != null) {
+              if (_selectedFriendIsInternet &&
+                  _selectedFriendId != null &&
+                  _selectedFriendId != AppConstants.aiAssistantUserId) ...[
+                IconButton(
+                  icon: const Icon(Icons.phone_rounded, color: AppTheme.textSecondary, size: 18),
+                  onPressed: () {
                     context.push(
                       '/call/$_selectedFriendId?name=${Uri.encodeComponent(_selectedFriendName ?? 'User')}&type=audio',
                     );
-                  }
-                },
-                tooltip: 'Voice Call',
-              ),
-              IconButton(
-                icon: const Icon(Icons.videocam_rounded, color: AppTheme.textSecondary, size: 18),
-                onPressed: () {
-                  if (_selectedFriendId != null) {
+                  },
+                  tooltip: 'Voice Call',
+                ),
+                IconButton(
+                  icon: const Icon(Icons.videocam_rounded, color: AppTheme.textSecondary, size: 18),
+                  onPressed: () {
                     context.push(
                       '/call/$_selectedFriendId?name=${Uri.encodeComponent(_selectedFriendName ?? 'User')}&type=video',
                     );
-                  }
-                },
-                tooltip: 'Video Call',
-              ),
+                  },
+                  tooltip: 'Video Call',
+                ),
+              ],
             ],
           ),
         ),

@@ -42,9 +42,22 @@
             <data android:mimeType="text/plain"/>
         </intent>
     </queries>
-<uses-permission android:name="android.permission.BLUETOOTH" />
+<!-- Needed in release builds too: the one-time local-model download goes over
+     HTTPS to the HuggingFace CDN, and the LAN/companion features talk to the
+     OmniConnect backend on the local network. -->
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.BLUETOOTH" />
     <uses-permission android:name="android.permission.BLUETOOTH_ADMIN" />
     <uses-permission android:name="android.permission.BLUETOOTH_SCAN" />
     <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
     <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
+    <!-- Internet calls: mic capture, camera capture, and audio routing
+         (speakerphone / in-communication mode). Neither is required, so the
+         app still installs on hardware without a camera or microphone. -->
+    <uses-permission android:name="android.permission.CAMERA" />
+    <uses-permission android:name="android.permission.RECORD_AUDIO" />
+    <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />
+    <uses-feature android:name="android.hardware.camera" android:required="false" />
+    <uses-feature android:name="android.hardware.camera.autofocus" android:required="false" />
+    <uses-feature android:name="android.hardware.microphone" android:required="false" />
 </manifest>

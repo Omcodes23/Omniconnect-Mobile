@@ -30,6 +30,7 @@ class LanDiscoveryService {
   String _selfDeviceModel = 'Android';
   String? _selfUserId;
   String? _selfUserName;
+  String? _selfIpAddress;
 
   /// Starts listening for UDP discovery broadcasts and initiates periodic presence broadcasts.
   Future<void> startDiscovery({
@@ -38,12 +39,14 @@ class LanDiscoveryService {
     String deviceModel = 'Mobile',
     String? userId,
     String? userName,
+    String? ipAddress,
   }) async {
     _selfDeviceId = deviceId;
     _selfDeviceName = deviceName;
     _selfDeviceModel = deviceModel;
     _selfUserId = userId;
     _selfUserName = userName;
+    _selfIpAddress = ipAddress;
 
     await stopDiscovery();
 
@@ -111,6 +114,7 @@ class LanDiscoveryService {
         'roles': 'Client',
         'availableTransports': ['LAN', 'WiFiDirect', 'Internet'],
         'port': 5001,
+        'ipAddress': _selfIpAddress, // Explicit IP for cross-platform discovery
         'userId': _selfUserId,
         'userName': _selfUserName,
       };
@@ -144,7 +148,7 @@ class LanDiscoveryService {
       final userId = json['userId']?.toString();
       final userName = json['userName']?.toString();
       final ipAddress = json['ipAddress']?.toString() ?? remoteAddress.address;
-      final port = json['port'] is int ? json['port'] as int : 5000;
+      final port = json['port'] is int ? json['port'] as int : 5001; // Default to 5001
 
       final dto = DeviceInfoDto(
         deviceId: deviceId,

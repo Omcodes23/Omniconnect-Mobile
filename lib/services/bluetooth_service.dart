@@ -68,29 +68,6 @@ class BluetoothService {
     }
   }
 
-  void _incomingJson(String json) {
-    try {
-      final decoded = jsonDecode(json) as Map<String, dynamic>;
-      final payload = BluetoothChatPayload(
-        type: decoded['type']?.toString() ?? 'chat',
-        fromPeerId: decoded['fromPeerId']?.toString() ?? '',
-        fromPeerName: decoded['fromPeerName']?.toString() ?? 'Peer',
-        toPeerId: decoded['toPeerId']?.toString() ?? '',
-        content: decoded['content']?.toString() ?? '',
-        clientMessageId: decoded['clientMessageId']?.toString() ?? '',
-        sentAt: decoded['sentAt']?.toString() ?? '',
-      );
-      _messageController.add(BluetoothMessage(
-        deviceId: payload.fromPeerId,
-        content: payload.content,
-        timestamp: DateTime.tryParse(payload.sentAt) ?? DateTime.now(),
-        isIncoming: true,
-        fromPeerName: payload.fromPeerName,
-        clientMessageId: payload.clientMessageId,
-      ));
-    } catch (_) {}
-  }
-
   /// Probe the platform for real Bluetooth RFCOMM capability.
   Future<bool> probe() async {
     try {
@@ -149,21 +126,21 @@ class BluetoothService {
   }) async {
     if (!_isAvailable || !_serverStarted) return false;
     try {
-      // Send raw JSON payload; Kotlin applies 2-byte length framing on the wire.
-      final jsonStr = jsonEncode({
-        'type': 'chat',
-        'fromPeerId': fromPeerId,
-        'fromPeerName': fromPeerName,
-        'toPeerId': toPeerId,
-        'content': content,
-        'clientMessageId': DateTime.now().millisecondsSinceEpoch.toString(),
-        'sentAt': DateTime.now().toUtc().toIso8601String(),
-      });
+      // Build OM Bluetooth Frame payload (matches Desktop Shared Models)
+      final framePayload = BluetoothFrame.chatPayload(
+        fromPeerId: fromPeerId,
+        fromPeerName: fromPeerName,
+        toPeerId: toPeerId,
+        content: content,
+        clientMessageId: DateTime.now().millisecondsSinceEpoch.toString(),
+        sentAt: DateTime.now().toUtc(),
+      );
+      final frame = BluetoothFrame(frameType: BluetoothFrame.frameTypeChat, payload: framePayload);
+      final frameBytes = frame.toBytes();
+      
+      // Send raw frame bytes; Android side expects full OM frame
       final ok = await _channel.invokeMethod('sendMessage', {
-        'toPeerId': toPeerId,
-        'fromPeerId': fromPeerId,
-        'fromPeerName': fromPeerName,
-        'content': jsonStr,
+        'frameBytes': frameBytes,
       }) as bool?;
       return ok == true;
     } catch (_) {
@@ -175,6 +152,13 @@ class BluetoothService {
     _serverStarted = false;
     try {
       await _channel.invokeMethod('stopServer');
+    } catch (_) {}
+  }
+
+  Future<void> disconnect() async {
+    _serverStarted = false;
+    try {
+      await _channel.invokeMethod('disconnect');
     } catch (_) {}
   }
 

@@ -1,9 +1,12 @@
 import 'dart:async';
+import 'dart:io';
+
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:uuid/uuid.dart';
 import 'auth_provider.dart';
 import 'lan_discovery_service.dart';
+import 'bluetooth_service.dart';
 
 class DeviceInfoDto {
   final String deviceId;
@@ -82,12 +85,18 @@ class DeviceListNotifier extends Notifier<DeviceListState> {
   String? _selfDeviceId;
   String _serverDeviceId = '';
   StreamSubscription<List<DeviceInfoDto>>? _lanSub;
+  StreamSubscription<BluetoothDevice>? _btSub;
+  StreamSubscription<bool>? _btAvailSub;
   final Map<String, DeviceInfoDto> _mergedDevices = {};
+  BluetoothService? _bluetoothService;
 
   @override
   DeviceListState build() {
     ref.onDispose(() {
       _lanSub?.cancel();
+      _btSub?.cancel();
+      _btAvailSub?.cancel();
+      _bluetoothService?.dispose();
     });
 
     // Listen to local LAN UDP discovery events
@@ -95,6 +104,17 @@ class DeviceListNotifier extends Notifier<DeviceListState> {
     _lanSub?.cancel();
     _lanSub = lanService.onDevicesChanged.listen((lanDevices) {
       _mergeLanDevices(lanDevices);
+    });
+
+    // Listen to Bluetooth discovery events
+    _bluetoothService = ref.watch(bluetoothServiceProvider);
+    _bluetoothService!.probe().then((available) {
+      if (available) {
+        _btSub?.cancel();
+        _btSub = _bluetoothService!.onDeviceDiscovered.listen((btDevice) {
+          _mergeBluetoothDevice(btDevice);
+        });
+      }
     });
 
     return const DeviceListState();
@@ -106,6 +126,21 @@ class DeviceListNotifier extends Notifier<DeviceListState> {
       if (_serverDeviceId.isNotEmpty && d.deviceId == _serverDeviceId) continue;
       _mergedDevices[d.deviceId] = d;
     }
+    state = state.copyWith(devices: _mergedDevices.values.toList());
+  }
+
+  void _mergeBluetoothDevice(BluetoothDevice btDevice) {
+    if (btDevice.id == _selfDeviceId) return;
+    if (_serverDeviceId.isNotEmpty && btDevice.id == _serverDeviceId) return;
+    final dto = DeviceInfoDto(
+      deviceId: btDevice.id,
+      deviceName: btDevice.name,
+      deviceModel: btDevice.type,
+      platform: 'Android',
+      isOnline: true,
+      availableTransports: ['Bluetooth'],
+    );
+    _mergedDevices[btDevice.id] = dto;
     state = state.copyWith(devices: _mergedDevices.values.toList());
   }
 
@@ -149,16 +184,47 @@ class DeviceListNotifier extends Notifier<DeviceListState> {
     return id;
   }
 
+  /// Detect the local LAN IP address of this device.
+  static Future<String?> _detectLocalIpAddress() async {
+    try {
+      final interfaces = await NetworkInterface.list(
+        includeLoopback: false,
+        type: InternetAddressType.IPv4,
+      );
+      for (final iface in interfaces) {
+        for (final addr in iface.addresses) {
+          if (addr.isLoopback) continue;
+          // Prefer non-link-local addresses
+          if (!addr.address.startsWith('169.254.')) {
+            return addr.address;
+          }
+        }
+      }
+      // Fallback: any non-loopback IPv4
+      for (final iface in interfaces) {
+        for (final addr in iface.addresses) {
+          if (!addr.isLoopback) {
+            return addr.address;
+          }
+        }
+      }
+    } catch (_) {}
+    return null;
+  }
+
   /// Register this device with the backend and start UDP LAN broadcast.
   Future<void> registerThisDevice({
     required String deviceId,
     required String deviceName,
     String deviceModel = 'Android',
     String? ipAddress,
-    int port = 5000,
+    int port = 5001, // Changed default to 5001 (direct listener port)
   }) async {
     _selfDeviceId = deviceId;
     final auth = ref.read(authStateProvider);
+
+    // Auto-detect LAN IP if not provided
+    final detectedIp = ipAddress ?? await _detectLocalIpAddress();
 
     // 1. Start Local UDP LAN Discovery & Broadcast
     final lanService = ref.read(lanDiscoveryServiceProvider);
@@ -168,18 +234,29 @@ class DeviceListNotifier extends Notifier<DeviceListState> {
       deviceModel: deviceModel,
       userId: auth.user?.id,
       userName: auth.user?.displayName,
+      ipAddress: detectedIp, // Pass explicit IP to LAN service
     );
 
-    // 2. Register with Central Backend API
+    // 2. Start Bluetooth Discovery (if available)
+    final btService = ref.read(bluetoothServiceProvider);
+    final btAvailable = await btService.probe();
+    if (btAvailable) {
+      await btService.enable();
+      await btService.startServer();
+    }
+
+    // 3. Register with Central Backend API
     try {
       final api = ref.read(apiServiceProvider);
+      final transports = ['LAN', 'WiFiDirect', 'Internet'];
+      if (btAvailable) transports.add('Bluetooth');
       await api.post('/api/devices/register', {
         'deviceId': deviceId,
         'deviceName': deviceName,
         'deviceModel': deviceModel,
         'roles': 'Client',
-        'availableTransports': ['LAN', 'WiFiDirect', 'Bluetooth', 'Internet'],
-        'ipAddress': ipAddress,
+        'availableTransports': transports,
+        'ipAddress': detectedIp,
         'port': port,
         'userId': auth.user?.id,
         'userName': auth.user?.displayName,
@@ -189,6 +266,13 @@ class DeviceListNotifier extends Notifier<DeviceListState> {
     }
   }
 }
+
+// Bluetooth service provider
+final bluetoothServiceProvider = Provider<BluetoothService>((ref) {
+  final service = BluetoothService();
+  ref.onDispose(() => service.dispose());
+  return service;
+});
 
 final deviceListProvider =
     NotifierProvider<DeviceListNotifier, DeviceListState>(DeviceListNotifier.new);
